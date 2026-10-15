@@ -42,4 +42,3 @@ jobs:
         run: pnpm exec playwright install --with-deps chromium
 
       - run: CI=true pnpm exec nx run-many -t test
-
