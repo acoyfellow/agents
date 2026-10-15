@@ -1,14 +1,11 @@
 name: Pull Request
 
 on:
-  pull_request:
-    paths-ignore:
-      - "design/**"
-      - "*.md"
-      - ".changeset/**"
+  push:
+    branches: [ci/voice-gate]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -27,8 +24,6 @@ jobs:
 
       - uses: ./.github/actions/install
 
-      - uses: nrwl/nx-set-shas@v5
-
       - run: pnpm run build
       - run: pnpm run check
 
@@ -46,6 +41,5 @@ jobs:
       - name: Install Playwright browsers
         run: pnpm exec playwright install --with-deps chromium
 
-      - run: CI=true pnpm exec nx affected -t test
+      - run: CI=true pnpm exec nx run-many -t test
 
-      - run: pnpm exec pkg-pr-new publish --peerDeps ./packages/*
