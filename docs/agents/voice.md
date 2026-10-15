@@ -217,11 +217,13 @@ async onTurn(transcript: string, context: VoiceTurnContext) {
 
 The `context` object provides:
 
-| Field        | Type                                       | Description                             |
-| ------------ | ------------------------------------------ | --------------------------------------- |
-| `connection` | `Connection`                               | The WebSocket connection                |
-| `messages`   | `Array<{ role: string; content: string }>` | Completed history before the transcript |
-| `signal`     | `AbortSignal`                              | Aborted on interrupt or disconnect      |
+| Field         | Type                                       | Description                                                                  |
+| ------------- | ------------------------------------------ | ---------------------------------------------------------------------------- |
+| `connection`  | `Connection`                               | The WebSocket connection                                                     |
+| `messages`    | `Array<{ role: string; content: string }>` | Completed history before the transcript                                      |
+| `signal`      | `AbortSignal`                              | Aborted on interrupt or disconnect                                           |
+| `speculative` | `boolean`                                  | `true` when the turn started on an eager end of turn (see Speculative Turns) |
+| `confirmed`   | `Promise<boolean>`                         | Resolves `true` once the turn is confirmed, `false` if it was dropped        |
 
 ### Lifecycle Hooks
 
@@ -279,6 +281,7 @@ const VoiceAgent = withVoice(Agent, {
   audioFormat: "mp3", // Audio format sent to client (default: "mp3")
   sampleRate: 16000, // Sample rate (Hz) for raw pcm16 payloads (default: 16000)
   maxMessageCount: 1000, // Max messages in SQLite (default: 1000)
+  speculativeTurns: false, // Start onTurn on an eager end of turn (default: false)
   diagnostics: {
     browserConsole: false // forward server diagnostics to browser console (default: false)
   }
@@ -376,12 +379,15 @@ Use a `MediaDeviceInfo.deviceId` from `navigator.mediaDevices.enumerateDevices()
 
 #### Tuning Options
 
-| Option               | Type     | Default | Description                                      |
-| -------------------- | -------- | ------- | ------------------------------------------------ |
-| `silenceThreshold`   | `number` | `0.04`  | RMS below this is silence                        |
-| `silenceDurationMs`  | `number` | `500`   | Silence duration before `end_of_speech` (ms)     |
-| `interruptThreshold` | `number` | `0.05`  | RMS to detect speech during playback             |
-| `interruptChunks`    | `number` | `2`     | Consecutive high-RMS chunks to trigger interrupt |
+| Option               | Type               | Default  | Description                                                                        |
+| -------------------- | ------------------ | -------- | ---------------------------------------------------------------------------------- |
+| `silenceThreshold`   | `number`           | `0.04`   | RMS below this is silence                                                          |
+| `silenceDurationMs`  | `number`           | `500`    | Silence duration before `end_of_speech` (ms)                                       |
+| `interruptThreshold` | `number`           | `0.05`   | RMS to detect speech during playback                                               |
+| `interruptChunks`    | `number`           | `2`      | Consecutive high-RMS chunks to trigger interrupt                                   |
+| `interruptMode`      | `"stop" \| "duck"` | `"stop"` | `"duck"` lowers playback on loud input and stops only when the user's words arrive |
+| `duckVolume`         | `number`           | `0.25`   | Playback gain while ducked (0–1)                                                   |
+| `duckReleaseMs`      | `number`           | `600`    | How long playback stays ducked after the noise stops without words (ms)            |
 
 Changing tuning options triggers a client reconnect (the connection key includes them).
 
@@ -455,27 +461,43 @@ client.disconnect();
 
 ### Events
 
-| Event               | Data Type             | Description                              |
-| ------------------- | --------------------- | ---------------------------------------- |
-| `statuschange`      | `VoiceStatus`         | Pipeline state changed                   |
-| `transcriptchange`  | `TranscriptMessage[]` | Transcript updated                       |
-| `interimtranscript` | `string \| null`      | Interim transcript from streaming STT    |
-| `turnmetrics`       | `VoiceTurnMetrics`    | Stable terminal per-turn summary metrics |
-| `audiolevelchange`  | `number`              | Mic audio level (0–1)                    |
-| `connectionchange`  | `boolean`             | WebSocket connected/disconnected         |
-| `mutechange`        | `boolean`             | Mute state changed                       |
-| `error`             | `string \| null`      | Error occurred                           |
-| `outputdeviceerror` | `string \| null`      | Non-fatal speaker routing issue          |
-| `custommessage`     | `unknown`             | Non-voice message from server            |
+| Event                 | Data Type             | Description                                                               |
+| --------------------- | --------------------- | ------------------------------------------------------------------------- |
+| `statuschange`        | `VoiceStatus`         | Pipeline state changed                                                    |
+| `transcriptchange`    | `TranscriptMessage[]` | Transcript updated                                                        |
+| `interimtranscript`   | `string \| null`      | Interim transcript from streaming STT                                     |
+| `turnmetrics`         | `VoiceTurnMetrics`    | Stable terminal per-turn summary metrics                                  |
+| `audiolevelchange`    | `number`              | Mic audio level (0–1)                                                     |
+| `playbacklevelchange` | `number`              | Assistant playback level (0–1), about 20 times a second while audio plays |
+| `connectionchange`    | `boolean`             | WebSocket connected/disconnected                                          |
+| `mutechange`          | `boolean`             | Mute state changed                                                        |
+| `error`               | `string \| null`      | Error occurred                                                            |
+| `outputdeviceerror`   | `string \| null`      | Non-fatal speaker routing issue                                           |
+| `custommessage`       | `unknown`             | Non-voice message from server                                             |
 
 ### Advanced Options
 
-| Option            | Type               | Description                                           |
-| ----------------- | ------------------ | ----------------------------------------------------- |
-| `transport`       | `VoiceTransport`   | Custom transport (default: WebSocket via PartySocket) |
-| `audioInput`      | `VoiceAudioInput`  | Custom mic capture (default: built-in AudioWorklet)   |
-| `preferredFormat` | `VoiceAudioFormat` | Hint for server audio format (advisory only)          |
-| `outputDeviceId`  | `string`           | Preferred `audiooutput` device for assistant playback |
+| Option            | Type               | Description                                                  |
+| ----------------- | ------------------ | ------------------------------------------------------------ |
+| `transport`       | `VoiceTransport`   | Custom transport (default: WebSocket via PartySocket)        |
+| `audioInput`      | `VoiceAudioInput`  | Custom mic capture (default: built-in AudioWorklet)          |
+| `preferredFormat` | `VoiceAudioFormat` | Hint for server audio format (advisory only)                 |
+| `outputDeviceId`  | `string`           | Preferred `audiooutput` device for assistant playback        |
+| `interruptMode`   | `"stop" \| "duck"` | What loud mic input does during playback (default: `"stop"`) |
+
+#### Status and playback
+
+`status` follows what the user hears. When the server finishes sending a reply it reports `listening`, but the browser may still be playing the last sentences. `VoiceClient` keeps `status` at `speaking` until local playback drains, then switches to `listening`. An interruption switches it at once. `client.isPlaying` and `client.playbackLevel` expose the same playback state directly.
+
+#### Barge-in modes
+
+With the default `interruptMode: "stop"`, loud mic input during playback stops the agent and sends `interrupt`. Echo, a cough, or a door can cut the agent off.
+
+With `interruptMode: "duck"`, loud input only lowers the agent's volume. Playback stops when the server reports the user's words: a non-empty interim transcript or a final user transcript. If the noise stops without words, the volume comes back after `duckReleaseMs`.
+
+```typescript
+const client = new VoiceClient({ agent: "MyAgent", interruptMode: "duck" });
+```
 
 ## Providers
 
@@ -603,6 +625,39 @@ const { interimTranscript, transcript } = useVoiceAgent({ agent: "MyAgent" });
 ```
 
 All transcriber providers use **model-driven turn detection** — the model detects when the user has finished speaking and triggers the pipeline. The client does not need to send `end_of_speech` for STT; `start_of_speech` and `end_of_speech` are only used for client-side UI state (speaking indicators, audio level).
+
+### Speculative Turns
+
+Waiting for a confirmed end of turn adds delay to every reply. Flux can also predict the end of a turn early (`EagerEndOfTurn`) and take the prediction back if the user keeps talking (`TurnResumed`). With `speculativeTurns: true`, the agent starts `onTurn` on the prediction and holds everything the turn sends, including audio, transcripts, and custom messages sent through `context.connection`, until the final transcript confirms the same words. If the user keeps talking, starts speaking again, or the final transcript differs, the held reply is dropped and `onTurn` runs again for the final words.
+
+```typescript
+const VoiceAgent = withVoice(Agent, { speculativeTurns: true });
+
+export class MyAgent extends VoiceAgent<Env> {
+  transcriber = new WorkersAIFluxSTT(this.env.AI, { eagerEotThreshold: 0.5 });
+  tts = new WorkersAITTS(this.env.AI);
+
+  async onTurn(transcript: string, context: VoiceTurnContext) {
+    const result = streamText({
+      model,
+      messages: [...context.messages, { role: "user", content: transcript }],
+      tools: {
+        setTimer: tool({
+          inputSchema: z.object({ minutes: z.number() }),
+          execute: async ({ minutes }) => {
+            if (!(await context.confirmed)) return "cancelled";
+            return this.setTimer(minutes);
+          }
+        })
+      },
+      abortSignal: context.signal
+    });
+    return result.fullStream;
+  }
+}
+```
+
+A speculative turn may be dropped, so await `context.confirmed` before any side effect the user did not finish asking for, such as tool calls that write data or send messages. Messages are saved to conversation history only after confirmation. Speculative turns need a transcriber that reports eager predictions through `onEagerUtterance` and `onTurnResumed`; `WorkersAIFluxSTT` does when `eagerEotThreshold` is set. Each dropped prediction costs one extra `onTurn` call.
 
 ## Text Messages
 

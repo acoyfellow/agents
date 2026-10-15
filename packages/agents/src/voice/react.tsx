@@ -273,7 +273,7 @@ export function useVoiceAgent(
 
   const connectionKey = useMemo(
     () =>
-      `${options.agent}:${options.name ?? "default"}:${options.host ?? ""}:${options.silenceThreshold ?? ""}:${options.silenceDurationMs ?? ""}:${options.interruptThreshold ?? ""}:${options.interruptChunks ?? ""}:${queryString}`,
+      `${options.agent}:${options.name ?? "default"}:${options.host ?? ""}:${options.silenceThreshold ?? ""}:${options.silenceDurationMs ?? ""}:${options.interruptThreshold ?? ""}:${options.interruptChunks ?? ""}:${options.interruptMode ?? ""}:${options.duckVolume ?? ""}:${options.duckReleaseMs ?? ""}:${queryString}`,
     [
       options.agent,
       options.name,
@@ -282,6 +282,9 @@ export function useVoiceAgent(
       options.silenceDurationMs,
       options.interruptThreshold,
       options.interruptChunks,
+      options.interruptMode,
+      options.duckVolume,
+      options.duckReleaseMs,
       queryString
     ]
   );

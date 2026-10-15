@@ -98,6 +98,20 @@ export interface VoiceClientOptions {
   interruptThreshold?: number;
   /** Consecutive high-RMS chunks needed to trigger an interrupt. @default 2 */
   interruptChunks?: number;
+  /**
+   * What loud mic input does while the agent is speaking.
+   * - `"stop"`: stop playback and send `interrupt` (the original behavior).
+   * - `"duck"`: lower playback to `duckVolume` and wait for words. Playback
+   *   stops only when the server reports the user's words (a non-empty
+   *   interim or final transcript), so a cough, echo, or background noise
+   *   no longer cuts the agent off.
+   * @default "stop"
+   */
+  interruptMode?: "stop" | "duck";
+  /** Playback gain while ducked, from 0 to 1. @default 0.25 */
+  duckVolume?: number;
+  /** How long playback stays ducked after the mic goes quiet without words (ms). @default 600 */
+  duckReleaseMs?: number;
   /** Maximum transcript messages to keep in memory. @default 200 */
   maxTranscriptMessages?: number;
 
@@ -136,6 +150,8 @@ export interface VoiceClientEventMap {
   metricschange: VoicePipelineMetrics | null;
   turnmetrics: VoiceTurnMetrics;
   audiolevelchange: number;
+  /** RMS level of assistant playback, about 20 times a second while audio plays, then 0. */
+  playbacklevelchange: number;
   connectionchange: boolean;
   connectiondiagnostic: VoiceConnectionDiagnostic;
   voiceerror: VoiceError;
@@ -328,6 +344,9 @@ export class VoiceClient {
   #silenceDurationMs: number;
   #interruptThreshold: number;
   #interruptChunks: number;
+  #interruptMode: "stop" | "duck";
+  #duckVolume: number;
+  #duckReleaseMs: number;
   #maxTranscriptMessages: number;
 
   // Transport
@@ -345,6 +364,13 @@ export class VoiceClient {
   #isPlaying = false;
   #isScheduling = false;
   #scheduledSources = new Set<AudioBufferSourceNode>();
+  #sourceGains = new Map<AudioBufferSourceNode, GainNode>();
+  #playbackAnalyser: AnalyserNode | null = null;
+  #playbackLevel = 0;
+  #playbackLevelTimer: ReturnType<typeof setInterval> | null = null;
+  #ducked = false;
+  #duckReleaseTimer: ReturnType<typeof setTimeout> | null = null;
+  #pendingListening = false;
   #playbackCursor = 0;
   // End time (on the AudioContext clock) of the most recently scheduled chunk.
   // Used to detect when the playback bridge has been idle across the gap
@@ -369,6 +395,9 @@ export class VoiceClient {
     this.#silenceDurationMs = options.silenceDurationMs ?? 500;
     this.#interruptThreshold = options.interruptThreshold ?? 0.05;
     this.#interruptChunks = options.interruptChunks ?? 2;
+    this.#interruptMode = options.interruptMode ?? "stop";
+    this.#duckVolume = options.duckVolume ?? 0.25;
+    this.#duckReleaseMs = options.duckReleaseMs ?? 600;
     this.#maxTranscriptMessages = options.maxTranscriptMessages ?? 200;
     this.#outputDeviceId = options.outputDeviceId ?? "default";
   }
@@ -394,6 +423,16 @@ export class VoiceClient {
 
   get audioLevel(): number {
     return this.#audioLevel;
+  }
+
+  /** Last measured RMS level of assistant playback. 0 when nothing is playing. */
+  get playbackLevel(): number {
+    return this.#playbackLevel;
+  }
+
+  /** True while assistant audio is queued or audibly playing in the browser. */
+  get isPlaying(): boolean {
+    return this.#isPlaying;
   }
 
   get isMuted(): boolean {
@@ -811,6 +850,14 @@ export class VoiceClient {
             : 16000;
         break;
       case "status":
+        if (msg.status === "listening" && this.#isPlaying) {
+          this.#pendingListening = true;
+          this.#serverCallAcknowledged = true;
+          this.#error = null;
+          this.#emit("error", null);
+          break;
+        }
+        this.#pendingListening = false;
         this.#status = msg.status as VoiceStatus;
         if (msg.status === "thinking" || msg.status === "speaking") {
           this.#audioReceivedForCurrentTurn = false;
@@ -841,6 +888,14 @@ export class VoiceClient {
       case "transcript_interim":
         this.#interimTranscript = msg.text as string;
         this.#emit("interimtranscript", this.#interimTranscript);
+        if (
+          this.#interruptMode === "duck" &&
+          this.#isPlaying &&
+          typeof msg.text === "string" &&
+          msg.text.trim().length > 0
+        ) {
+          this.#interruptPlayback();
+        }
         break;
       case "playback_interrupt":
         this.#stopPlayback("server_interrupt");
@@ -981,6 +1036,7 @@ export class VoiceClient {
       this.#closePlaybackOutput();
       this.#audioContext.close().catch(() => {});
       this.#audioContext = null;
+      this.#playbackAnalyser = null;
       this.#workletRegistered = false;
     }
   }
@@ -1163,10 +1219,17 @@ export class VoiceClient {
 
       const source = ctx.createBufferSource();
       source.buffer = audioBuffer;
-      source.connect(destination);
+      const gain = ctx.createGain();
+      gain.gain.value = this.#ducked ? this.#duckVolume : 1;
+      source.connect(gain);
+      gain.connect(destination);
+      gain.connect(this.#getPlaybackAnalyser(ctx));
       this.#scheduledSources.add(source);
+      this.#sourceGains.set(source, gain);
       source.onended = () => {
         this.#scheduledSources.delete(source);
+        this.#sourceGains.delete(source);
+        gain.disconnect();
         if (
           generation === this.#playbackGeneration &&
           !this.#isScheduling &&
@@ -1175,6 +1238,7 @@ export class VoiceClient {
         ) {
           this.#isPlaying = false;
           this.#diagnostics.emit("playback.completed");
+          this.#playbackDrained();
         }
       };
 
@@ -1194,10 +1258,78 @@ export class VoiceClient {
     }
   }
 
+  #getPlaybackAnalyser(ctx: AudioContext): AnalyserNode {
+    if (!this.#playbackAnalyser) {
+      this.#playbackAnalyser = ctx.createAnalyser();
+      this.#playbackAnalyser.fftSize = 512;
+    }
+    return this.#playbackAnalyser;
+  }
+
+  #startPlaybackLevel(): void {
+    if (this.#playbackLevelTimer) return;
+    if (!this.#listeners.get("playbacklevelchange")?.size) return;
+    const samples = new Float32Array(512);
+    this.#playbackLevelTimer = setInterval(() => {
+      const analyser = this.#playbackAnalyser;
+      if (!analyser) return;
+      analyser.getFloatTimeDomainData(samples);
+      let sum = 0;
+      for (const sample of samples) sum += sample * sample;
+      this.#playbackLevel = Math.sqrt(sum / samples.length);
+      this.#emit("playbacklevelchange", this.#playbackLevel);
+    }, 50);
+  }
+
+  #stopPlaybackLevel(): void {
+    if (this.#playbackLevelTimer) {
+      clearInterval(this.#playbackLevelTimer);
+      this.#playbackLevelTimer = null;
+    }
+    if (this.#playbackLevel !== 0) {
+      this.#playbackLevel = 0;
+      this.#emit("playbacklevelchange", 0);
+    }
+  }
+
+  #playbackDrained(): void {
+    this.#stopPlaybackLevel();
+    this.#setDucked(false);
+    if (this.#pendingListening) {
+      this.#pendingListening = false;
+      this.#status = "listening";
+      this.#emit("statuschange", this.#status);
+    }
+  }
+
+  #setDucked(ducked: boolean): void {
+    if (this.#duckReleaseTimer) {
+      clearTimeout(this.#duckReleaseTimer);
+      this.#duckReleaseTimer = null;
+    }
+    if (this.#ducked === ducked) return;
+    this.#ducked = ducked;
+    const level = ducked ? this.#duckVolume : 1;
+    const now = this.#audioContext?.currentTime ?? 0;
+    for (const gain of this.#sourceGains.values()) {
+      gain.gain.setTargetAtTime(level, now, 0.03);
+    }
+    this.#diagnostics.emit(ducked ? "playback.ducked" : "playback.unducked");
+  }
+
+  #interruptPlayback(): void {
+    this.#diagnostics.emit("speech.interrupt_detected");
+    this.#stopPlayback("speech_interrupt");
+    if (this.#transport?.connected) {
+      this.#transport.sendJSON({ type: "interrupt" });
+    }
+  }
+
   async #processPlaybackQueue(): Promise<void> {
     if (this.#isScheduling || this.#playbackQueue.length === 0) return;
     this.#isScheduling = true;
     this.#isPlaying = true;
+    this.#startPlaybackLevel();
     this.#diagnostics.emit("playback.started", {
       chunks: this.#playbackQueue.length
     });
@@ -1215,6 +1347,7 @@ export class VoiceClient {
       this.#isScheduling = false;
       if (this.#scheduledSources.size === 0) {
         this.#isPlaying = false;
+        this.#playbackDrained();
       }
     }
   }
@@ -1235,10 +1368,12 @@ export class VoiceClient {
         // The source may already have ended or been stopped by another signal.
       }
     }
+    this.#sourceGains.clear();
     this.#playbackQueue = [];
     this.#isPlaying = false;
     this.#isScheduling = false;
     this.#playbackCursor = 0;
+    this.#playbackDrained();
     // An interrupt (barge-in or a user transcript) stops playback abruptly, so
     // the bridge goes idle from now, not from the cut chunk's scheduled end.
     // Record the current audio-clock time as the idle start so the next turn's
@@ -1340,17 +1475,27 @@ export class VoiceClient {
 
     // Interruption detection: user speaking during agent playback
     if (this.#isPlaying && rms > this.#interruptThreshold) {
+      if (this.#duckReleaseTimer) {
+        clearTimeout(this.#duckReleaseTimer);
+        this.#duckReleaseTimer = null;
+      }
       this.#interruptChunkCount++;
       if (this.#interruptChunkCount >= this.#interruptChunks) {
-        this.#diagnostics.emit("speech.interrupt_detected");
-        this.#stopPlayback("speech_interrupt");
         this.#interruptChunkCount = 0;
-        if (this.#transport?.connected) {
-          this.#transport.sendJSON({ type: "interrupt" });
+        if (this.#interruptMode === "duck") {
+          this.#setDucked(true);
+        } else {
+          this.#interruptPlayback();
         }
       }
     } else {
       this.#interruptChunkCount = 0;
+      if (this.#ducked && !this.#duckReleaseTimer) {
+        this.#duckReleaseTimer = setTimeout(() => {
+          this.#duckReleaseTimer = null;
+          this.#setDucked(false);
+        }, this.#duckReleaseMs);
+      }
     }
 
     // Silence detection

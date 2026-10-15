@@ -68,6 +68,36 @@ class FakeAudioBufferSourceNode {
   }
 }
 
+class FakeGainNode {
+  gain = {
+    value: 1,
+    targets: [] as number[],
+    setTargetAtTime(value: number) {
+      this.value = value;
+      this.targets.push(value);
+    }
+  };
+  outputs: unknown[] = [];
+  disconnected = false;
+
+  connect(destination: unknown): void {
+    this.outputs.push(destination);
+  }
+
+  disconnect(): void {
+    this.disconnected = true;
+  }
+}
+
+class FakeAnalyserNode {
+  fftSize = 2048;
+  level = 0;
+
+  getFloatTimeDomainData(samples: Float32Array): void {
+    samples.fill(this.level);
+  }
+}
+
 class FakeAudioContext {
   state: AudioContextState = "running";
   currentTime = 0;
@@ -108,6 +138,19 @@ class FakeAudioContext {
     this.source = new FakeAudioBufferSourceNode();
     this.sources.push(this.source);
     return this.source as unknown as AudioBufferSourceNode;
+  }
+
+  gains: FakeGainNode[] = [];
+  analyser = new FakeAnalyserNode();
+
+  createGain(): GainNode {
+    const gain = new FakeGainNode();
+    this.gains.push(gain);
+    return gain as unknown as GainNode;
+  }
+
+  createAnalyser(): AnalyserNode {
+    return this.analyser as unknown as AnalyserNode;
   }
 
   createMediaStreamDestination(): MediaStreamAudioDestinationNode {
@@ -219,9 +262,15 @@ let originalAudio: typeof Audio | undefined;
 let audioContext: FakeAudioContext;
 let audioElement: FakeAudioElement;
 
+function outputOf(source: FakeAudioBufferSourceNode): unknown {
+  const gain = source.connectedTo as FakeGainNode | null;
+  return gain?.outputs[0] ?? null;
+}
+
 async function waitForConnectedSource(): Promise<FakeAudioBufferSourceNode> {
   for (let i = 0; i < 10; i++) {
-    if (audioContext.source?.connectedTo) return audioContext.source;
+    if (audioContext.source && outputOf(audioContext.source))
+      return audioContext.source;
     await Promise.resolve();
   }
   throw new Error("expected audio source to be connected");
@@ -610,7 +659,7 @@ describe("VoiceClient playback interrupt", () => {
 
     const source = await waitForConnectedSource();
     expect(source.stopped).toBe(false);
-    expect(source.connectedTo).toBe(audioContext.mediaStreamDestination);
+    expect(outputOf(source)).toBe(audioContext.mediaStreamDestination);
     expect(audioElement.srcObject).toBe(
       audioContext.mediaStreamDestination.stream
     );
@@ -695,7 +744,7 @@ describe("VoiceClient playback interrupt", () => {
 
     const source = await waitForConnectedSource();
 
-    expect(source.connectedTo).toBe(audioContext.mediaStreamDestination);
+    expect(outputOf(source)).toBe(audioContext.mediaStreamDestination);
     expect(audioElement.playCount).toBe(1);
     expect(audioElement.sinkIds).toEqual(["missing-speaker"]);
     expect(outputDeviceErrors).toContain(
@@ -848,7 +897,7 @@ describe("VoiceClient playback interrupt", () => {
 
       const source = await waitForConnectedSource();
 
-      expect(source.connectedTo).toBe(audioContext.destination);
+      expect(outputOf(source)).toBe(audioContext.destination);
       expect(audioElement.playCount).toBe(1);
       expect(audioElement.srcObject).toBeNull();
     } finally {
@@ -881,7 +930,7 @@ describe("VoiceClient playback interrupt", () => {
     await startCall;
     const source = await waitForConnectedSource();
 
-    expect(source.connectedTo).toBe(audioContext.mediaStreamDestination);
+    expect(outputOf(source)).toBe(audioContext.mediaStreamDestination);
     expect(audioContext.mediaStreamDestinationCount).toBe(1);
   });
 
@@ -1431,5 +1480,176 @@ describe("VoiceClient playback bridge reuse", () => {
 
     expect(audioContext.mediaStreamDestinationCount).toBe(1);
     expect(audioElement.playCount).toBe(1);
+  });
+});
+
+describe("VoiceClient playback-aware status, ducking, and playback level", () => {
+  function pcm16Chunk(): ArrayBuffer {
+    return new ArrayBuffer(1600 * 2);
+  }
+
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  }
+
+  async function startCall(
+    options: Partial<ConstructorParameters<typeof VoiceClient>[0]> = {}
+  ) {
+    const transport = new MockTransport();
+    const audioInput = new FakeAudioInput();
+    const client = new VoiceClient({
+      agent: "test-agent",
+      transport,
+      audioInput,
+      interruptThreshold: 0.1,
+      interruptChunks: 1,
+      ...options
+    });
+    client.connect();
+    transport.receive(
+      JSON.stringify({ type: "audio_config", format: "pcm16" })
+    );
+    await client.startCall();
+    return { transport, audioInput, client };
+  }
+
+  function speak(transport: MockTransport, chunks = 1): void {
+    transport.receive(JSON.stringify({ type: "status", status: "speaking" }));
+    for (let i = 0; i < chunks; i++) transport.receive(pcm16Chunk());
+  }
+
+  it("stays speaking until the browser has finished playing the reply", async () => {
+    const { transport, client } = await startCall();
+    const statuses: string[] = [];
+    client.addEventListener("statuschange", (status) => statuses.push(status));
+
+    speak(transport);
+    const [source] = await waitForSourceCount(1);
+    await settle();
+    transport.receive(JSON.stringify({ type: "status", status: "listening" }));
+
+    expect(client.status).toBe("speaking");
+    expect(client.isPlaying).toBe(true);
+    expect(statuses).toEqual(["speaking"]);
+
+    source.onended?.();
+
+    expect(client.status).toBe("listening");
+    expect(client.isPlaying).toBe(false);
+    expect(statuses).toEqual(["speaking", "listening"]);
+  });
+
+  it("goes to listening at once when playback is interrupted", async () => {
+    const { transport, client } = await startCall();
+
+    speak(transport);
+    await waitForSourceCount(1);
+    await settle();
+    transport.receive(JSON.stringify({ type: "status", status: "listening" }));
+    transport.receive(JSON.stringify({ type: "playback_interrupt" }));
+
+    expect(client.status).toBe("listening");
+  });
+
+  it("drops a deferred listening when the server moves on to another status", async () => {
+    const { transport, client } = await startCall();
+
+    speak(transport);
+    const [source] = await waitForSourceCount(1);
+    await settle();
+    transport.receive(JSON.stringify({ type: "status", status: "listening" }));
+    transport.receive(JSON.stringify({ type: "status", status: "thinking" }));
+    source.onended?.();
+
+    expect(client.status).toBe("thinking");
+  });
+
+  it("still stops playback on loud input in the default stop mode", async () => {
+    const { transport, audioInput } = await startCall();
+
+    speak(transport);
+    const [source] = await waitForSourceCount(1);
+    audioInput.onAudioLevel?.(0.3);
+
+    expect(source.stopped).toBe(true);
+    expect(transport.sentJSON).toContainEqual({ type: "interrupt" });
+  });
+
+  it("ducks on loud input and cuts only when the user's words arrive", async () => {
+    const { transport, audioInput } = await startCall({
+      interruptMode: "duck",
+      duckVolume: 0.2
+    });
+
+    speak(transport);
+    const [source] = await waitForSourceCount(1);
+    audioInput.onAudioLevel?.(0.3);
+
+    expect(source.stopped).toBe(false);
+    expect(audioContext.gains[0]?.gain.targets).toEqual([0.2]);
+    expect(transport.sentJSON).not.toContainEqual({ type: "interrupt" });
+
+    transport.receive(JSON.stringify({ type: "transcript_interim", text: "" }));
+    expect(source.stopped).toBe(false);
+
+    transport.receive(
+      JSON.stringify({ type: "transcript_interim", text: "wait" })
+    );
+    expect(source.stopped).toBe(true);
+    expect(transport.sentJSON).toContainEqual({ type: "interrupt" });
+  });
+
+  it("restores the volume when the noise stops without words", async () => {
+    const { transport, audioInput } = await startCall({
+      interruptMode: "duck",
+      duckVolume: 0.2,
+      duckReleaseMs: 10
+    });
+
+    speak(transport);
+    const [source] = await waitForSourceCount(1);
+    audioInput.onAudioLevel?.(0.3);
+    audioInput.onAudioLevel?.(0.01);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(source.stopped).toBe(false);
+    expect(audioContext.gains[0]?.gain.targets).toEqual([0.2, 1]);
+  });
+
+  it("starts new chunks quiet while ducked", async () => {
+    const { transport, audioInput } = await startCall({
+      interruptMode: "duck",
+      duckVolume: 0.2
+    });
+
+    speak(transport);
+    await waitForSourceCount(1);
+    audioInput.onAudioLevel?.(0.3);
+    transport.receive(pcm16Chunk());
+    await waitForSourceCount(2);
+
+    expect(audioContext.gains[1]?.gain.value).toBe(0.2);
+  });
+
+  it("reports the assistant's playback level while audio plays, then zero", async () => {
+    const { transport, client } = await startCall();
+    const levels: number[] = [];
+    client.addEventListener("playbacklevelchange", (level) =>
+      levels.push(level)
+    );
+    audioContext.analyser.level = 0.5;
+
+    speak(transport);
+    await waitForSourceCount(1);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    expect(levels.length).toBeGreaterThan(0);
+    expect(levels[0]).toBeCloseTo(0.5, 5);
+    expect(client.playbackLevel).toBeCloseTo(0.5, 5);
+
+    transport.receive(JSON.stringify({ type: "playback_interrupt" }));
+
+    expect(levels.at(-1)).toBe(0);
+    expect(client.playbackLevel).toBe(0);
   });
 });
