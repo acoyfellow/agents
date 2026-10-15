@@ -1188,6 +1188,7 @@ export function withVoice<TBase extends AgentLike>(
         this.#discardSpeculativeTurn(connection, speculative, "mismatch");
         return false;
       }
+      speculative.active?.turn.confirmSpeculativeInput();
       speculative.active?.turn.emit("turn.speculative_confirmed");
       speculative.confirm();
       return true;

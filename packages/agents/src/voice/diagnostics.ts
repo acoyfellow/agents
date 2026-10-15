@@ -277,6 +277,17 @@ export class TurnDiagnostics {
     }
   }
 
+  confirmSpeculativeInput(): void {
+    const now = this.#now();
+    if (this.#finalInputAt !== undefined) {
+      this.#metrics.speculativeLeadMs = safeDuration(now - this.#finalInputAt);
+    }
+    this.#finalInputAt = now;
+    if (this.#firstAudioAt !== undefined) {
+      this.#metrics.finalInputToFirstAudioMs = 0;
+    }
+  }
+
   audioSent(): void {
     const now = this.#now();
     if (this.#firstAudioAt !== undefined) return;

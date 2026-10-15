@@ -1024,7 +1024,6 @@ class ScriptedTranscriberSession implements TranscriberSession {
   close(): void {}
 }
 
-
 /**
  * Test VoiceAgent with speculative turns enabled. The test drives the
  * transcriber directly: `_eager`, `_resumed`, `_final`, `_speech_start`.
@@ -1034,73 +1033,77 @@ function scriptedVoiceAgent<TBase extends ReturnType<typeof withVoice>>(
   Base: TBase
 ) {
   return class ScriptedVoiceAgent extends Base {
-  tts = new TestTTS();
-  #session: ScriptedTranscriberSession | null = null;
-  #turns: Array<{ transcript: string; speculative: boolean }> = [];
-  #confirmations: boolean[] = [];
-  #toolRuns: string[] = [];
-  #turnDelayMs = 0;
+    tts = new TestTTS();
+    #session: ScriptedTranscriberSession | null = null;
+    #turns: Array<{ transcript: string; speculative: boolean }> = [];
+    #confirmations: boolean[] = [];
+    #toolRuns: string[] = [];
+    #turnDelayMs = 0;
 
-  createTranscriber(_connection: Connection): Transcriber {
-    return {
-      createSession: (options?: TranscriberSessionOptions) => {
-        this.#session = new ScriptedTranscriberSession(options);
-        return this.#session;
-      }
-    };
-  }
-
-  async onTurn(transcript: string, context: VoiceTurnContext) {
-    this.#turns.push({ transcript, speculative: context.speculative });
-    void context.confirmed.then((confirmed) => {
-      this.#confirmations.push(confirmed);
-      if (confirmed) this.#toolRuns.push(transcript);
-    });
-    if (this.#turnDelayMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, this.#turnDelayMs));
+    createTranscriber(_connection: Connection): Transcriber {
+      return {
+        createSession: (options?: TranscriberSessionOptions) => {
+          this.#session = new ScriptedTranscriberSession(options);
+          return this.#session;
+        }
+      };
     }
-    return `Echo: ${transcript}`;
-  }
 
-  onMessage(connection: Connection, message: WSMessage) {
-    if (typeof message !== "string") return;
-    const parsed = JSON.parse(message) as { type: string; text?: string; value?: number };
-    const options = this.#session?.options;
-    switch (parsed.type) {
-      case "_eager":
-        options?.onEagerUtterance?.(parsed.text ?? "");
-        break;
-      case "_resumed":
-        options?.onTurnResumed?.();
-        break;
-      case "_final":
-        options?.onUtterance?.(parsed.text ?? "");
-        break;
-      case "_speech_start":
-        options?.onSpeechStart?.();
-        break;
-      case "_set_turn_delay":
-        this.#turnDelayMs = parsed.value ?? 0;
-        break;
-      case "_get_speculation":
-        connection.send(
-          JSON.stringify({
-            type: "_speculation",
-            turns: this.#turns,
-            confirmations: this.#confirmations,
-            toolRuns: this.#toolRuns,
-            messages: this.sql<{ role: string; text: string }>`
+    async onTurn(transcript: string, context: VoiceTurnContext) {
+      this.#turns.push({ transcript, speculative: context.speculative });
+      void context.confirmed.then((confirmed) => {
+        this.#confirmations.push(confirmed);
+        if (confirmed) this.#toolRuns.push(transcript);
+      });
+      if (this.#turnDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.#turnDelayMs));
+      }
+      return `Echo: ${transcript}`;
+    }
+
+    onMessage(connection: Connection, message: WSMessage) {
+      if (typeof message !== "string") return;
+      const parsed = JSON.parse(message) as {
+        type: string;
+        text?: string;
+        value?: number;
+      };
+      const options = this.#session?.options;
+      switch (parsed.type) {
+        case "_eager":
+          options?.onEagerUtterance?.(parsed.text ?? "");
+          break;
+        case "_resumed":
+          options?.onTurnResumed?.();
+          break;
+        case "_final":
+          options?.onUtterance?.(parsed.text ?? "");
+          break;
+        case "_speech_start":
+          options?.onSpeechStart?.();
+          break;
+        case "_set_turn_delay":
+          this.#turnDelayMs = parsed.value ?? 0;
+          break;
+        case "_get_speculation":
+          connection.send(
+            JSON.stringify({
+              type: "_speculation",
+              turns: this.#turns,
+              confirmations: this.#confirmations,
+              toolRuns: this.#toolRuns,
+              messages: this.sql<{ role: string; text: string }>`
               SELECT role, text FROM cf_voice_messages ORDER BY id
             `
-          })
-        );
-        return;
-      default:
-        return;
+            })
+          );
+          return;
+        default:
+          return;
+      }
+      connection.send(JSON.stringify({ type: "_ack", command: parsed.type }));
     }
-    connection.send(JSON.stringify({ type: "_ack", command: parsed.type }));
-  }
-}
+  };
 }
 
 export class TestSpeculativeVoiceAgent extends scriptedVoiceAgent(

@@ -82,8 +82,14 @@ export interface VoiceTurnMetrics {
   exposedReasoningMs?: number;
   /** Model invocation through normalized stream consumption. */
   modelStreamConsumptionMs?: number;
-  /** Finalized input through the first server audio send. */
+  /**
+   * Finalized input through the first server audio send. For a speculative
+   * turn this is measured from confirmation, so audio prepared before the
+   * user finished counts as 0.
+   */
   finalInputToFirstAudioMs?: number;
+  /** For a confirmed speculative turn, eager prediction to confirmation. */
+  speculativeLeadMs?: number;
 
   /** First TTS provider invocation through the first server audio send. */
   ttsToFirstAudioMs?: number;

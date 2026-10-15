@@ -95,7 +95,8 @@ function replyFrames(frames: Received[]) {
       (f.type === "transcript" && f.role === "user") ||
       f.type === "transcript_start" ||
       f.type === "transcript_end" ||
-      (f.type === "status" && (f.status === "thinking" || f.status === "speaking"))
+      (f.type === "status" &&
+        (f.status === "thinking" || f.status === "speaking"))
   );
 }
 
@@ -113,9 +114,15 @@ describe("VoiceAgent — speculative turns", () => {
     expect(replyFrames(frames)).toEqual([]);
 
     const end = assistantEnd(ws);
+    const metrics = waitFor(ws, (m) => m.type === "turn_metrics");
     await command(ws, { type: "_final", text: "What time is it" });
     expect((await end).text).toBe("Echo: what time is it");
     expect(frames).toContain("audio");
+
+    const summary = await metrics;
+    expect(summary.outcome).toBe("completed");
+    expect(summary.finalInputToFirstAudioMs).toBe(0);
+    expect(summary.speculativeLeadMs).toBeGreaterThanOrEqual(100);
 
     const state = await speculation(ws);
     expect(state.turns).toEqual([
@@ -221,7 +228,9 @@ describe("VoiceAgent — speculative turns", () => {
     expect((await end).text).toBe("Echo: hi there");
 
     const state = await speculation(ws);
-    expect(state.turns).toEqual([{ transcript: "hi there", speculative: false }]);
+    expect(state.turns).toEqual([
+      { transcript: "hi there", speculative: false }
+    ]);
     ws.close();
   });
 });
