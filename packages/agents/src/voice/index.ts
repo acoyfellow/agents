@@ -136,6 +136,20 @@ export interface VoiceTurnContext {
   /** Completed conversation history before the current transcript. */
   messages: Array<{ role: VoiceRole; content: string }>;
   signal: AbortSignal;
+  /**
+   * True when this turn started on an eager end-of-turn prediction and the
+   * user may still keep talking. Audio and messages sent through `connection`
+   * are held until the turn is confirmed, and dropped if it is not.
+   * Only set when `speculativeTurns` is enabled.
+   */
+  speculative: boolean;
+  /**
+   * Resolves `true` once the user's turn is confirmed, or `false` if the user
+   * kept talking and this turn was dropped. Always `true` for normal turns.
+   * Await it before side effects such as tool calls that must not run for
+   * words the user did not finish saying.
+   */
+  confirmed: Promise<boolean>;
 }
 
 /** Configuration options for the voice mixin. Passed to `withVoice()`. */
@@ -156,6 +170,64 @@ export interface VoiceAgentOptions {
   maxMessageCount?: number;
   /** Optional diagnostic output. Diagnostic event names and metadata are not stable API. */
   diagnostics?: VoiceDiagnosticsOptions;
+  /**
+   * Start `onTurn` when the transcriber predicts the end of the user's turn
+   * (for Flux, `EagerEndOfTurn` with `eagerEotThreshold` set), holding the
+   * reply until the turn is confirmed. Cuts the wait for final end of turn
+   * from every reply, at the cost of extra `onTurn` calls that get dropped
+   * when the user keeps talking. Requires a transcriber that calls
+   * `onEagerUtterance`. @default false
+   */
+  speculativeTurns?: boolean;
+}
+
+interface SpeculativeTurn {
+  transcript: string;
+  connection: Connection;
+  confirmed: Promise<boolean>;
+  settled: boolean;
+  active?: ActiveTurnDiagnostics;
+  onConfirm?: () => void;
+  confirm(): void;
+  discard(): void;
+}
+
+function normalizeTranscript(text: string): string {
+  return text.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function holdConnection(connection: Connection): {
+  connection: Connection;
+  release(): void;
+  discard(): void;
+} {
+  let state: "holding" | "open" | "closed" = "holding";
+  let queue: Array<Parameters<Connection["send"]>[0]> = [];
+  const send = (data: Parameters<Connection["send"]>[0]) => {
+    if (state === "holding") queue.push(data);
+    else if (state === "open") connection.send(data);
+  };
+  const held = new Proxy(connection, {
+    get(target, prop) {
+      if (prop === "send") return send;
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+  return {
+    connection: held,
+    release() {
+      if (state !== "holding") return;
+      state = "open";
+      const pending = queue;
+      queue = [];
+      for (const data of pending) connection.send(data);
+    },
+    discard() {
+      state = "closed";
+      queue = [];
+    }
+  };
 }
 
 // --- Default option values ---
@@ -322,6 +394,7 @@ export function withVoice<TBase extends AgentLike>(
     #callTokens = new Map<string, symbol>();
     #turnSequence = 0;
     #inputTurns = new Map<string, TurnDiagnostics>();
+    #speculativeTurns = new Map<string, SpeculativeTurn>();
     #activeTurnDiagnostics = new Map<string, ActiveTurnDiagnostics>();
 
     // Voice protocol message types handled internally
@@ -811,19 +884,30 @@ export function withVoice<TBase extends AgentLike>(
           },
           onSpeechStart: () => {
             if (this.#callTokens.get(connection.id) !== startupToken) return;
+            this.#dropSpeculativeTurn(connection, "speech_started");
             const turn = this.#replaceInputTurn(connection);
             turn.speechStarted();
             this.#handleBargeIn(connection);
           },
           onUtterance: (transcript: string) => {
             if (this.#callTokens.get(connection.id) !== startupToken) return;
-            const turn = this.#takeInputTurn(connection);
-            turn.finalInput(transcript.length);
             this.#sendJSON(connection, {
               type: "transcript_interim",
               text: ""
             });
+            if (this.#confirmSpeculativeTurn(connection, transcript)) return;
+            const turn = this.#takeInputTurn(connection);
+            turn.finalInput(transcript.length);
             this.#runPipeline(connection, transcript, turn);
+          },
+          onEagerUtterance: (transcript: string) => {
+            if (!opts.speculativeTurns) return;
+            if (this.#callTokens.get(connection.id) !== startupToken) return;
+            this.#startSpeculativeTurn(connection, transcript);
+          },
+          onTurnResumed: () => {
+            if (this.#callTokens.get(connection.id) !== startupToken) return;
+            this.#dropSpeculativeTurn(connection, "turn_resumed");
           },
           onFatalError: (error: Error) => {
             runBackground("transcriber_fatal", () =>
@@ -1057,7 +1141,82 @@ export function withVoice<TBase extends AgentLike>(
       return turn;
     }
 
+    #startSpeculativeTurn(connection: Connection, transcript: string): void {
+      this.#dropSpeculativeTurn(connection, "replaced");
+      const turn = this.#takeInputTurn(connection);
+      turn.finalInput(transcript.length);
+      turn.emit("turn.speculative_started");
+      const held = holdConnection(connection);
+      let settle: (confirmed: boolean) => void = () => {};
+      const speculative: SpeculativeTurn = {
+        transcript,
+        connection: held.connection,
+        confirmed: new Promise<boolean>((resolve) => {
+          settle = resolve;
+        }),
+        settled: false,
+        confirm() {
+          if (speculative.settled) return;
+          speculative.settled = true;
+          held.release();
+          speculative.onConfirm?.();
+          settle(true);
+        },
+        discard() {
+          if (speculative.settled) return;
+          speculative.settled = true;
+          held.discard();
+          settle(false);
+        }
+      };
+      this.#speculativeTurns.set(connection.id, speculative);
+      this.#runPipeline(held.connection, transcript, turn, speculative);
+    }
+
+    #confirmSpeculativeTurn(
+      connection: Connection,
+      transcript: string
+    ): boolean {
+      const speculative = this.#speculativeTurns.get(connection.id);
+      if (!speculative) return false;
+      this.#speculativeTurns.delete(connection.id);
+      const usable =
+        normalizeTranscript(speculative.transcript) ===
+          normalizeTranscript(transcript) &&
+        !speculative.active?.signal.aborted;
+      if (!usable) {
+        this.#discardSpeculativeTurn(connection, speculative, "mismatch");
+        return false;
+      }
+      speculative.active?.turn.emit("turn.speculative_confirmed");
+      speculative.confirm();
+      return true;
+    }
+
+    #dropSpeculativeTurn(connection: Connection, reason: string): void {
+      const speculative = this.#speculativeTurns.get(connection.id);
+      if (!speculative) return;
+      this.#speculativeTurns.delete(connection.id);
+      this.#discardSpeculativeTurn(connection, speculative, reason);
+    }
+
+    #discardSpeculativeTurn(
+      connection: Connection,
+      speculative: SpeculativeTurn,
+      reason: string
+    ): void {
+      speculative.discard();
+      const active = speculative.active;
+      if (!active) return;
+      active.turn.emit("turn.speculative_discarded", { reason });
+      if (this.#activeTurnDiagnostics.get(connection.id) === active) {
+        active.model?.abort();
+        this.#cm.abortPipeline(connection.id);
+      }
+    }
+
     #abortInputTurn(connection: Connection, reason: string): void {
+      this.#dropSpeculativeTurn(connection, reason);
       const turn = this.#inputTurns.get(connection.id);
       if (!turn) return;
       this.#inputTurns.delete(connection.id);
@@ -1140,7 +1299,9 @@ export function withVoice<TBase extends AgentLike>(
         const context: VoiceTurnContext = {
           connection,
           messages: priorMessages,
-          signal
+          signal,
+          speculative: false,
+          confirmed: Promise.resolve(true)
         };
 
         const model = turn.startModel();
@@ -1324,10 +1485,12 @@ export function withVoice<TBase extends AgentLike>(
     async #runPipeline(
       connection: Connection,
       transcript: string,
-      turn: TurnDiagnostics
+      turn: TurnDiagnostics,
+      speculative?: SpeculativeTurn
     ) {
       const pipelineStart = Date.now();
       const active = this.#beginTurnDiagnostics(connection, "speech", turn);
+      if (speculative) speculative.active = active;
       const { signal } = active;
       let turnOutcome: VoiceTurnOutcome = "completed";
 
@@ -1347,7 +1510,9 @@ export function withVoice<TBase extends AgentLike>(
         }
 
         const priorMessages = this.getConversationHistory();
-        this.saveMessage("user", userText);
+        const saveUserMessage = () => this.saveMessage("user", userText);
+        if (!speculative || speculative.settled) saveUserMessage();
+        else speculative.onConfirm = saveUserMessage;
         this.#sendJSON(connection, {
           type: "transcript",
           role: "user",
@@ -1359,7 +1524,9 @@ export function withVoice<TBase extends AgentLike>(
         const context: VoiceTurnContext = {
           connection,
           messages: priorMessages,
-          signal
+          signal,
+          speculative: speculative !== undefined,
+          confirmed: speculative?.confirmed ?? Promise.resolve(true)
         };
 
         const model = turn.startModel();
@@ -1425,6 +1592,9 @@ export function withVoice<TBase extends AgentLike>(
           first_audio_ms: firstAudioMs,
           total_ms: totalMs
         });
+
+        if (speculative && !(await speculative.confirmed)) return;
+        if (signal.aborted) return;
 
         // Feed the agent's spoken reply back to the transcriber as context for
         // the user's next turn (no-op for providers without context carryover).

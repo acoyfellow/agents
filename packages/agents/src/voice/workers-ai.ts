@@ -189,6 +189,8 @@ class FluxSession implements TranscriberSession {
   #onInterim: TranscriberSessionOptions["onInterim"];
   #onSpeechStart: TranscriberSessionOptions["onSpeechStart"];
   #onUtterance: TranscriberSessionOptions["onUtterance"];
+  #onEagerUtterance: TranscriberSessionOptions["onEagerUtterance"];
+  #onTurnResumed: TranscriberSessionOptions["onTurnResumed"];
   #onFatalError: TranscriberSessionOptions["onFatalError"];
 
   #ws: WebSocket | null = null;
@@ -211,6 +213,8 @@ class FluxSession implements TranscriberSession {
     this.#onInterim = options?.onInterim;
     this.#onSpeechStart = options?.onSpeechStart;
     this.#onUtterance = options?.onUtterance;
+    this.#onEagerUtterance = options?.onEagerUtterance;
+    this.#onTurnResumed = options?.onTurnResumed;
     this.#onFatalError = options?.onFatalError;
     this.#ready = new Promise<void>((resolve, reject) => {
       this.#resolveReady = resolve;
@@ -412,11 +416,13 @@ class FluxSession implements TranscriberSession {
           if (transcript) {
             this.#currentTranscript = transcript;
             this.#onInterim?.(transcript);
+            this.#onEagerUtterance?.(transcript);
           }
           break;
 
         case "TurnResumed":
           this.#currentTranscript = transcript;
+          this.#onTurnResumed?.();
           if (transcript) {
             this.#onInterim?.(transcript);
           }

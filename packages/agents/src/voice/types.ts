@@ -284,6 +284,19 @@ export interface TranscriberSessionOptions {
    */
   onUtterance?: (transcript: string) => void;
   /**
+   * Called when the model predicts the turn is probably over, before it is
+   * certain. The transcript is the text so far. A voice pipeline can start
+   * working on a reply here and hold its audio until `onUtterance` confirms
+   * the same words, or drop it on `onTurnResumed`.
+   * For Flux: fires on `EagerEndOfTurn` (requires `eagerEotThreshold`).
+   */
+  onEagerUtterance?: (transcript: string) => void;
+  /**
+   * Called when speech continues after an `onEagerUtterance`, meaning that
+   * prediction was wrong. For Flux: fires on `TurnResumed`.
+   */
+  onTurnResumed?: () => void;
+  /**
    * Called when the session can no longer transcribe because its provider
    * connection failed or closed unexpectedly. Providers must not call this
    * for teardown initiated by {@link TranscriberSession.close}.

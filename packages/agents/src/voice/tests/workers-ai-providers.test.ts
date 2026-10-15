@@ -286,6 +286,38 @@ describe("WorkersAIFluxSTT", () => {
     expect(utterances).toEqual(["not done yet"]);
   });
 
+  it("reports eager end of turn and turn resumed to the session callbacks", async () => {
+    const ai = new MockAi();
+    const events: string[] = [];
+
+    new WorkersAIFluxSTT(ai, { eagerEotThreshold: 0.5 }).createSession({
+      onEagerUtterance: (text) => events.push(`eager:${text}`),
+      onTurnResumed: () => events.push("resumed"),
+      onUtterance: (text) => events.push(`final:${text}`)
+    });
+
+    const socket = await waitForConnect(ai);
+    socket.message(
+      JSON.stringify({ event: "EagerEndOfTurn", transcript: "turn it" })
+    );
+    socket.message(
+      JSON.stringify({ event: "TurnResumed", transcript: "turn it up" })
+    );
+    socket.message(
+      JSON.stringify({ event: "EagerEndOfTurn", transcript: "turn it up" })
+    );
+    socket.message(
+      JSON.stringify({ event: "EndOfTurn", transcript: "turn it up" })
+    );
+
+    expect(events).toEqual([
+      "eager:turn it",
+      "resumed",
+      "eager:turn it up",
+      "final:turn it up"
+    ]);
+  });
+
   it("reports one fatal error for an unexpected socket error and close", async () => {
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
     const ai = new MockAi();

@@ -40,6 +40,14 @@
         "name": "TestPcm24kVoiceAgent"
       },
       {
+        "class_name": "TestSpeculativeVoiceAgent",
+        "name": "TestSpeculativeVoiceAgent"
+      },
+      {
+        "class_name": "TestEagerIgnoredVoiceAgent",
+        "name": "TestEagerIgnoredVoiceAgent"
+      },
+      {
         "class_name": "TestVoiceInputAgent",
         "name": "TestVoiceInputAgent"
       },
@@ -64,6 +72,8 @@
         "TestAiSdkFullStreamVoiceAgent",
         "TestAiSdkTextStreamVoiceAgent",
         "TestPcm24kVoiceAgent",
+        "TestSpeculativeVoiceAgent",
+        "TestEagerIgnoredVoiceAgent",
         "TestVoiceInputAgent",
         "TestDiagnosticVoiceInputAgent",
         "TestRejectCallVoiceInputAgent"
